@@ -1,0 +1,881 @@
+# Step 1: INSTALL DEPENDENCIES
+
+!pip install -q langchain langchain-openai langchain-community \
+langchain-google-genai langgraph tavily-python faiss-cpu
+
+
+print("🚀 Agentic AI With Memory Script Started")
+
+def main():
+    print("Memory-enabled pipeline running...")
+
+if __name__ == "__main__":
+    main()
+
+
+
+# Step 2: CONFIGURATION & API KEYS
+
+import os
+import json
+import hashlib
+from datetime import datetime
+from pathlib import Path
+
+# Load API keys
+try:
+    from google.colab import userdata
+    os.environ["OPENAI_API_KEY"] = userdata.get("OPENAI_API_KEY")
+    os.environ["TAVILY_API_KEY"] = userdata.get("TAVILY_API_KEY")
+    # os.environ["GOOGLE_API_KEY"] = userdata.get("GOOGLE_API_KEY")
+    print(" API keys loaded from Colab Secrets")
+except Exception:
+    print("  Set API keys manually or via Colab Secrets")
+
+CONFIG = {
+    "llm_provider": "openai",          # "openai" or "google"
+    "model_name": "gpt-4o",            # or "gemini-1.5-flash"
+    "temperature": 0.3,
+    "max_search_results": 8,
+    "max_revisions": 2,
+    "topic": "Latest AI News and Breakthroughs 2025-2026",
+    # Memory paths (persisted to Colab filesystem)
+    "memory_dir": "./agent_memory",
+    "vectorstore_path": "./agent_memory/vectorstore",
+    "knowledge_base_path": "./agent_memory/knowledge_base.json",
+    "episodes_path": "./agent_memory/episodes.json",
+    "strategies_path": "./agent_memory/strategies.json",
+}
+
+# Create memory directory
+Path(CONFIG["memory_dir"]).mkdir(parents=True, exist_ok=True)
+print(f"🔧 Config: {CONFIG['llm_provider']} / {CONFIG['model_name']}")
+print(f"Memory dir: {CONFIG['memory_dir']}")
+
+# Step 3: IMPORTS & LLM SETUP
+from typing import TypedDict, Annotated, List, Dict, Optional
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, BaseMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
+from langchain_core.documents import Document
+from langchain_community.tools.tavily_search import TavilySearchResults
+from langchain_openai import OpenAIEmbeddings
+from langgraph.graph import StateGraph, END, START
+import operator
+
+# Initialize LLM
+if CONFIG["llm_provider"] == "openai":
+    from langchain_openai import ChatOpenAI
+    llm = ChatOpenAI(model=CONFIG["model_name"], temperature=CONFIG["temperature"])
+elif CONFIG["llm_provider"] == "google":
+    from langchain_google_genai import ChatGoogleGenerativeAI
+    llm = ChatGoogleGenerativeAI(model=CONFIG["model_name"], temperature=CONFIG["temperature"])
+
+# Initialize embeddings for long-term memory
+embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+
+# Initialize search tool
+search_tool = TavilySearchResults(
+    max_results=CONFIG["max_search_results"],
+    search_depth="advanced",
+    include_answer=True,
+)
+
+print(" LLM, Embeddings, and Search tool initialized")
+
+class MemoryManager:
+    def __init__(self, config: Dict):
+        self.config = config
+        self.vectorstore = None  # Initialized later
+        self.knowledge_base = self._load_json(config["knowledge_base_path"], default={"entities": {}, "source_reliability": {}})
+        self.episodes = self._load_json(config["episodes_path"], default=[])
+        self.strategies = self._load_json(config["strategies_path"], default={
+            "total_runs": 0,
+            "avg_quality_score": 0,
+            "best_query_patterns": [],
+            "preferred_html_template": "",
+            "writer_tips": []
+        })
+        self._init_vectorstore()
+
+    def _load_json(self, path: str, default=None):
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+                # Ensure the loaded data matches the default type if default is a list
+                if isinstance(default, list) and not isinstance(data, list):
+                    print(f"    Warning: '{path}' contained an unexpected type ({type(data)}), returning default list.")
+                    return default
+                return data
+        except (FileNotFoundError, json.JSONDecodeError):
+            return default if default is not None else {}
+
+    def _save_json(self, path: str, data):
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2, default=str)
+
+    # ── 2. LONG-TERM MEMORY (Vector Store) ──
+
+    def _init_vectorstore(self):
+        """Load or create FAISS vector store."""
+        try:
+            from langchain_community.vectorstores import FAISS
+            vs_path = self.config["vectorstore_path"]
+            if Path(vs_path).exists() and Path(f"{vs_path}/index.faiss").exists():
+                self.vectorstore = FAISS.load_local(
+                    vs_path, embeddings,
+                    allow_dangerous_deserialization=True
+                )
+                print(f"      Vector Store: loaded ({self.vectorstore.index.ntotal} vectors)")
+            else:
+                # Create empty store with a placeholder
+                self.vectorstore = FAISS.from_documents(
+                    [Document(page_content="initialization", metadata={"type": "system"})],
+                    embeddings
+                )
+                print("      Vector Store: created new (empty)")
+        except Exception as e:
+            print(f"       Vector Store init failed: {e}")
+            self.vectorstore = None
+
+    def search_similar_articles(self, query: str, k: int = 5) -> List[dict]:
+        """Search long-term memory for similar past articles."""
+        if not self.vectorstore:
+            return []
+        try:
+            docs = self.vectorstore.similarity_search(query, k=k)
+            return [
+                {"content": d.page_content, "metadata": d.metadata}
+                for d in docs if d.metadata.get("type") != "system"
+            ]
+        except Exception:
+            return []
+
+    def store_articles(self, articles: List[dict]):
+        """Save new articles to long-term vector memory."""
+        if not self.vectorstore:
+            return
+        docs = []
+        for article in articles:
+            content = f"{article.get('headline', '')}: {article.get('summary', '')}"
+            # Dedup check via hash
+            content_hash = hashlib.md5(content.encode()).hexdigest()
+            docs.append(Document(
+                page_content=content,
+                metadata={
+                    "type": "article",
+                    "url": article.get("url", ""),
+                    "category": article.get("category", ""),
+                    "source": article.get("source", ""),
+                    "hash": content_hash,
+                    "timestamp": datetime.now().isoformat(),
+                }
+            ))
+        if docs:
+            self.vectorstore.add_documents(docs)
+            self.vectorstore.save_local(self.config["vectorstore_path"])
+            print(f"     💾 Stored {len(docs)} articles in long-term memory")
+
+    # ── 3. SEMANTIC MEMORY (Knowledge Base) ──
+
+    def get_known_entities(self) -> Dict[str, dict]:
+        """Retrieve known entities from semantic memory."""
+        return self.knowledge_base.get("entities", {})
+
+    def update_entities(self, new_entities: Dict[str, dict]):
+        """Add/update entities in semantic memory."""
+        self.knowledge_base["entities"].update(new_entities)
+        self._save_json(self.config["knowledge_base_path"], self.knowledge_base)
+
+    def get_source_reliability(self, source: str) -> float:
+        """Get reliability score for a source (0.0 to 1.0)."""
+        return self.knowledge_base.get("source_reliability", {}).get(source, 0.5)
+
+    def update_source_reliability(self, source: str, score: float):
+        """Update source reliability score."""
+        if "source_reliability" not in self.knowledge_base:
+            self.knowledge_base["source_reliability"] = {}
+        self.knowledge_base["source_reliability"][source] = round(score, 2)
+        self._save_json(self.config["knowledge_base_path"], self.knowledge_base)
+
+    # ── 4. EPISODIC MEMORY (Run History) ──
+
+    def get_recent_episodes(self, n: int = 5) -> List[dict]:
+        """Retrieve the N most recent run episodes."""
+        return self.episodes[-n:]
+
+    def get_past_lessons(self) -> List[str]:
+        """Extract actionable lessons from past episodes."""
+        lessons = []
+        # Defensive check: ensure self.episodes is a list
+        if not isinstance(self.episodes, list):
+            print(f"    WARNING: Episodes memory ({self.config['episodes_path']}) is not a list ({type(self.episodes)}), re-initializing to empty list.")
+            self.episodes = [] # Force it to be a list
+            # Optionally, save the corrected empty list to disk if you suspect file corruption
+            # self._save_json(self.config["episodes_path"], self.episodes)
+
+        for ep in self.episodes[-10:]:
+            if ep.get("qa_feedback") and not ep.get("qa_passed_first_try", True):
+                lessons.append(f"Run {ep.get('run_id', '?')}: {ep['qa_feedback']}")
+        return lessons[-5:]  # Keep last 5 lessons
+
+    def log_episode(self, episode: dict):
+        """Record a new episode to episodic memory."""
+        episode["timestamp"] = datetime.now().isoformat()
+        episode["run_id"] = f"run_{len(self.episodes) + 1:03d}"
+        self.episodes.append(episode)
+        self._save_json(self.config["episodes_path"], self.episodes)
+        print(f"     Logged episode: {episode['run_id']}")
+
+    # ── 5. PROCEDURAL MEMORY (Strategies) ──
+
+    def get_best_query_patterns(self) -> List[str]:
+        """Retrieve successful search query patterns."""
+        return self.strategies.get("best_query_patterns", [])
+
+    def get_preferred_template(self) -> str:
+        """Get the preferred HTML template style."""
+        return self.strategies.get("preferred_html_template", "")
+
+    def get_writer_tips(self) -> List[str]:
+        """Get accumulated writer improvement tips."""
+        return self.strategies.get("writer_tips", [])
+
+    def update_strategies(self, qa_score: int, qa_feedback: str, queries_used: List[str]):
+        """Update procedural memory based on QA results."""
+        s = self.strategies
+        s["total_runs"] = s.get("total_runs", 0) + 1
+        total = s["total_runs"]
+
+        # Running average of quality scores
+        prev_avg = s.get("avg_quality_score", 0)
+        s["avg_quality_score"] = round(((prev_avg * (total - 1)) + qa_score) / total, 2)
+
+        # Store successful queries (score >= 7)
+        if qa_score >= 7 and queries_used:
+            existing = set(s.get("best_query_patterns", []))
+            for q in queries_used[:3]:
+                existing.add(q)
+            s["best_query_patterns"] = list(existing)[-20:]  # Keep top 20
+
+        # Store writer tips from QA feedback
+        if qa_feedback and qa_score < 7:
+            tips = s.get("writer_tips", [])
+            tips.append(qa_feedback[:200])
+            s["writer_tips"] = tips[-10:]  # Keep last 10
+
+        self._save_json(self.config["strategies_path"], s)
+        print(f"       Strategies updated (avg score: {s['avg_quality_score']})")
+
+
+# Initialize the Memory Manager
+memory = MemoryManager(CONFIG)
+print("\n Memory system fully initialized!")
+
+# Step 5: DEFINE SHARED STATE SCHEMA (with Memory Fields)
+class AgentState(TypedDict):
+    """Shared state with memory-enhanced fields."""
+
+    # ── Input ──
+    topic: str
+
+    # ── Short-Term Memory (working state per run) ──
+    search_queries: List[str]
+    raw_search_results: List[dict]
+    articles: List[dict]
+    page_title: str
+    page_description: str
+    html_content: str
+    qa_passed: bool
+    qa_feedback: str
+    qa_score: int
+    revision_count: int
+    agent_log: Annotated[List[str], operator.add]
+
+    # ── Memory-Enhanced Fields ──
+    similar_past_articles: List[dict]    # from long-term memory (FAISS)
+    known_entities: Dict[str, dict]      # from semantic memory (KB)
+    past_run_lessons: List[str]          # from episodic memory
+    preferred_template: str              # from procedural memory
+    best_query_patterns: List[str]       # from procedural memory
+    writer_tips: List[str]               # from procedural memory
+
+print("AgentState schema defined (with memory fields)")
+
+# Step 6: MEMORY NODES — Load & Save Memory at Key Transitions
+
+def load_memory_node(state: AgentState) -> dict:
+    """
+    Memory Load Node
+    Runs BEFORE agents start. Retrieves relevant context from all memory types
+    and injects it into the shared state.
+    """
+    print(" [Memory] Loading context from all memory types...")
+
+    topic = state["topic"]
+
+    # Long-term: find similar past articles
+    similar = memory.search_similar_articles(topic, k=5)
+    print(f"    Long-term: found {len(similar)} similar past articles")
+
+    # Semantic: load known entities
+    entities = memory.get_known_entities()
+    print(f"    Semantic: {len(entities)} known entities")
+
+    # Episodic: extract lessons from past runs
+    lessons = memory.get_past_lessons()
+    print(f"    Episodic: {len(lessons)} lessons from past runs")
+
+    # Procedural: load strategies
+    best_patterns = memory.get_best_query_patterns()
+    template = memory.get_preferred_template()
+    tips = memory.get_writer_tips()
+    print(f"     Procedural: {len(best_patterns)} query patterns, {len(tips)} writer tips")
+
+    return {
+        "similar_past_articles": similar,
+        "known_entities": entities,
+        "past_run_lessons": lessons,
+        "best_query_patterns": best_patterns,
+        "preferred_template": template,
+        "writer_tips": tips,
+        "agent_log": [f"[Memory Load] Retrieved context from all 5 memory types"],
+    }
+
+
+def save_memory_node(state: AgentState) -> dict:
+    """
+     Memory Save Node
+    Runs AFTER the QA agent. Persists new knowledge back to long-term,
+    semantic, episodic, and procedural memory.
+    """
+    print(" [Memory] Persisting new knowledge...")
+
+    # Long-term: store new articles
+    articles = state.get("articles", [])
+    if articles:
+        memory.store_articles(articles)
+
+    # Semantic: extract and store new entities
+    try:
+        entity_prompt = ChatPromptTemplate.from_messages([
+            ("system", """Extract key entities from these article headlines.
+Return JSON: {{"entities": {{"EntityName": {{"type": "company|person|product|org|concept", "context": "brief note"}}}}}}
+Only include clearly identifiable entities. Return 5-15 max."""),
+            ("human", "{headlines}")
+        ])
+        headlines = "\n".join([a.get("headline", "") for a in articles[:10]])
+        chain = entity_prompt | llm | JsonOutputParser()
+        result = chain.invoke({"headlines": headlines})
+        new_entities = result.get("entities", {})
+        if new_entities:
+            memory.update_entities(new_entities)
+            print(f"    Semantic: added {len(new_entities)} entities")
+    except Exception as e:
+        print(f"     Entity extraction failed: {e}")
+
+    # Episodic: log this run
+    memory.log_episode({
+        "topic": state.get("topic", ""),
+        "num_articles": len(articles),
+        "qa_passed_first_try": state.get("revision_count", 0) <= 1,
+        "qa_score": state.get("qa_score", 0),
+        "qa_feedback": state.get("qa_feedback", ""),
+        "revision_count": state.get("revision_count", 0),
+        "queries_used": state.get("search_queries", []),
+    })
+
+    # Procedural: update strategies
+    memory.update_strategies(
+        qa_score=state.get("qa_score", 7),
+        qa_feedback=state.get("qa_feedback", ""),
+        queries_used=state.get("search_queries", []),
+    )
+
+    return {
+        "agent_log": [f"[Memory Save] Persisted to LTM, semantic, episodic, procedural"],
+    }
+
+
+
+# Step 7: AGENT 1 — ORCHESTRATOR (Memory-Enhanced)
+
+def orchestrator_agent(state: AgentState) -> dict:
+    """
+     Orchestrator Agent (Memory-Enhanced)
+    Uses episodic memory (past lessons) and procedural memory (best patterns)
+    to generate smarter search queries.
+    """
+    print(" [Orchestrator] Planning with memory context...")
+
+    # Pull memory context
+    past_lessons = state.get("past_run_lessons", [])
+    best_patterns = state.get("best_query_patterns", [])
+    similar_articles = state.get("similar_past_articles", [])
+
+    lessons_text = "\n".join(past_lessons) if past_lessons else "No past lessons yet."
+    patterns_text = "\n".join(best_patterns[:5]) if best_patterns else "No proven patterns yet."
+    seen_topics = "\n".join([a.get("content", "")[:100] for a in similar_articles[:3]]) if similar_articles else "No prior coverage."
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", """You are a strategic research planner for an AI news system.
+Generate 3-5 specific, diverse search queries for the given topic.
+
+MEMORY CONTEXT — use this to make smarter queries:
+- Past QA lessons (avoid these mistakes): {lessons}
+- Previously successful query patterns: {patterns}
+- Topics already covered (avoid duplicates): {seen_topics}
+
+Return ONLY valid JSON: {{"queries": ["query 1", "query 2", "query 3"]}}"""),
+        ("human", "Topic: {topic}\nDate: {date}")
+    ])
+
+    chain = prompt | llm | JsonOutputParser()
+    result = chain.invoke({
+        "topic": state["topic"],
+        "date": datetime.now().strftime("%B %d, %Y"),
+        "lessons": lessons_text,
+        "patterns": patterns_text,
+        "seen_topics": seen_topics,
+    })
+
+    queries = result.get("queries", [state["topic"]])
+    print(f"   📋 Generated {len(queries)} queries (memory-informed)")
+    for i, q in enumerate(queries, 1):
+        print(f"      {i}. {q}")
+
+    return {
+        "search_queries": queries,
+        "revision_count": state.get("revision_count", 0),
+        "agent_log": [f"[Orchestrator] {len(queries)} memory-informed queries"],
+    }
+
+# Step 8: AGENT 2 — RESEARCH AGENT (Memory-Enhanced)
+
+def research_agent(state: AgentState) -> dict:
+    """
+     Research Agent (Memory-Enhanced)
+    Checks long-term memory for duplicates before adding results.
+    """
+    print(" [Research Agent] Searching (with dedup from long-term memory)...")
+
+    all_results = []
+    seen_urls = set()
+
+    # Get URLs of articles already in long-term memory
+    similar_past = state.get("similar_past_articles", [])
+    known_urls = {a.get("metadata", {}).get("url", "") for a in similar_past}
+
+    for query in state["search_queries"]:
+        try:
+            results = search_tool.invoke(query)
+            for r in results:
+                url = r.get("url", "")
+                if url not in seen_urls and url not in known_urls:
+                    seen_urls.add(url)
+                    all_results.append({
+                        "title": r.get("title", "Untitled"),
+                        "url": url,
+                        "content": r.get("content", ""),
+                        "query": query,
+                    })
+                elif url in known_urls:
+                    print(f"     Skipped (already in memory): {url[:60]}")
+            print(f"   ✓ '{query}' → {len(results)} results")
+        except Exception as e:
+            print(f"   ✗ '{query}' → Error: {e}")
+
+    print(f"    Total new unique results: {len(all_results)}")
+
+    return {
+        "raw_search_results": all_results,
+        "agent_log": [f"[Research] {len(all_results)} new results (deduped against memory)"],
+    }
+
+# Step 9: AGENT 3 — WRITER AGENT (Memory-Enhanced)
+
+def writer_agent(state: AgentState) -> dict:
+    """
+     Writer Agent (Memory-Enhanced)
+    Uses semantic memory for entity consistency and episodic memory for lessons.
+    """
+    print("  [Writer Agent] Synthesizing (with memory context)...")
+
+    # Memory context
+    entities = state.get("known_entities", {})
+    lessons = state.get("past_run_lessons", [])
+    writer_tips = state.get("writer_tips", [])
+
+    # Build memory hints
+    entity_hint = ""
+    if entities:
+        sample = dict(list(entities.items())[:10])
+        entity_hint = f"\nKNOWN ENTITIES (use consistent naming): {json.dumps(sample, default=str)}"
+
+    tips_hint = ""
+    if writer_tips:
+        tips_hint = f"\nWRITER TIPS FROM PAST QA (follow these): " + " | ".join(writer_tips[-3:])
+
+    revision_note = ""
+    if state.get("qa_feedback") and state.get("revision_count", 0) > 0:
+        revision_note = f"\n\nQA FEEDBACK TO ADDRESS: {state['qa_feedback']}"
+
+    search_data = json.dumps(state["raw_search_results"][:15], indent=2, default=str)
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", """You are an expert AI news journalist.
+Transform raw search results into polished article summaries.
+{entity_hint}{tips_hint}{revision_note}
+
+Return ONLY valid JSON:
+{{
+  "page_title": "Compelling title",
+  "page_description": "Brief description",
+  "articles": [
+    {{
+      "headline": "Headline",
+      "summary": "2-3 sentence summary",
+      "category": "Research|Industry|Policy|Product|Open Source",
+      "source": "Source name",
+      "url": "URL",
+      "importance": "high|medium|low"
+    }}
+  ]
+}}
+
+Include 5-10 articles, sorted by importance."""),
+        ("human", "Search data:\n{search_data}")
+    ])
+
+    chain = prompt | llm | JsonOutputParser()
+    result = chain.invoke({
+        "search_data": search_data,
+        "entity_hint": entity_hint,
+        "tips_hint": tips_hint,
+        "revision_note": revision_note,
+    })
+
+    articles = result.get("articles", [])
+    print(f"    Generated {len(articles)} articles (entity-consistent, lesson-aware)")
+
+    return {
+        "articles": articles,
+        "page_title": result.get("page_title", "AI News Roundup"),
+        "page_description": result.get("page_description", ""),
+        "agent_log": [f"[Writer] {len(articles)} articles (memory-enhanced)"],
+    }
+
+# Step 10: AGENT 4 — HTML BUILDER (Memory-Enhanced)
+
+def html_builder_agent(state: AgentState) -> dict:
+    """
+     HTML Builder Agent (Memory-Enhanced)
+    Loads preferred template from procedural memory if available.
+    """
+    print("  [HTML Builder] Generating page...")
+
+    articles = state.get("articles", [])
+    page_title = state.get("page_title", "AI News")
+    page_desc = state.get("page_description", "")
+    preferred_template = state.get("preferred_template", "")
+
+    template_hint = ""
+    if preferred_template:
+        template_hint = f"Use this preferred style approach: {preferred_template[:300]}"
+        print("   📐 Using preferred template from procedural memory")
+
+    # Build article HTML
+    colors = {"Research":"#7b61ff","Industry":"#00d4aa","Policy":"#ff6b9d","Product":"#ffaa40","Open Source":"#4ecdc4"}
+
+    cards_html = ""
+    for i, art in enumerate(articles):
+        cat = art.get("category", "General")
+        col = colors.get(cat, "#888")
+        imp = art.get("importance", "medium")
+        badge_css = "font-size:12px;padding:4px 12px;" if imp == "high" else "font-size:11px;padding:3px 10px;"
+
+        cards_html += f"""
+        <article class="card" style="animation-delay:{i*0.08}s">
+          <div class="badge" style="background:{col}15;color:{col};border:1px solid {col}33;{badge_css}">{cat}</div>
+          <h2 class="card-title">{art.get("headline","Untitled")}</h2>
+          <p class="card-summary">{art.get("summary","")}</p>
+          <div class="card-footer">
+            <span class="card-source">{art.get("source","")}</span>
+            <a href="{art.get("url","#")}" target="_blank" class="card-link">Read Full Article →</a>
+          </div>
+        </article>"""
+
+    gen_date = datetime.now().strftime("%B %d, %Y at %I:%M %p")
+    run_num = memory.strategies.get("total_runs", 0) + 1
+    num_entities = len(memory.knowledge_base.get("entities", {}))
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{page_title}</title>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=Newsreader:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {{ --bg:#0b0b12; --sf:#13131c; --bd:#252538; --tx:#e4e4f0; --dm:#8e8eac; --ac:#7b61ff; }}
+  *{{margin:0;padding:0;box-sizing:border-box;}}
+  body{{font-family:'Outfit',sans-serif;background:var(--bg);color:var(--tx);line-height:1.65;}}
+  .hero{{text-align:center;padding:72px 24px 56px;background:linear-gradient(180deg,#161626,var(--bg));border-bottom:1px solid var(--bd);}}
+  .hero-badge{{display:inline-flex;align-items:center;gap:8px;padding:5px 14px;border:1px solid var(--ac);border-radius:100px;font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--ac);margin-bottom:22px;}}
+  .hero-badge::before{{content:'';width:6px;height:6px;border-radius:50%;background:var(--ac);animation:blink 2s infinite;}}
+  .hero h1{{font-family:'Newsreader',serif;font-size:clamp(30px,5vw,52px);font-weight:700;line-height:1.12;margin-bottom:14px;background:linear-gradient(135deg,#fff,#bbb);-webkit-background-clip:text;-webkit-text-fill-color:transparent;}}
+  .hero p{{font-size:15px;color:var(--dm);max-width:580px;margin:0 auto 8px;}}
+  .hero .meta{{font-size:11px;color:#555;}}
+  .memory-bar{{display:flex;justify-content:center;gap:16px;margin-top:16px;flex-wrap:wrap;}}
+  .memory-stat{{display:flex;align-items:center;gap:6px;padding:4px 12px;background:rgba(123,97,255,.06);border:1px solid rgba(123,97,255,.15);border-radius:8px;font-size:11px;color:var(--ac);}}
+  .wrap{{max-width:880px;margin:0 auto;padding:36px 24px 72px;}}
+  .grid{{display:grid;gap:18px;}}
+  .card{{background:var(--sf);border:1px solid var(--bd);border-radius:14px;padding:26px;transition:transform .3s,box-shadow .3s;animation:fadeUp .5s ease both;}}
+  .card:hover{{transform:translateY(-3px);box-shadow:0 12px 40px rgba(0,0,0,.3);}}
+  .badge{{display:inline-block;border-radius:6px;font-weight:600;margin-bottom:12px;}}
+  .card-title{{font-size:19px;font-weight:700;line-height:1.3;margin-bottom:8px;}}
+  .card-summary{{font-size:13px;color:var(--dm);line-height:1.7;margin-bottom:14px;}}
+  .card-footer{{display:flex;justify-content:space-between;align-items:center;padding-top:12px;border-top:1px solid var(--bd);}}
+  .card-source{{font-size:11px;color:#555;font-weight:500;}}
+  .card-link{{font-size:12px;color:var(--ac);text-decoration:none;font-weight:500;}}
+  .card-link:hover{{text-decoration:underline;}}
+  footer{{text-align:center;padding:28px;border-top:1px solid var(--bd);font-size:11px;color:#444;}}
+  @keyframes fadeUp{{from{{opacity:0;transform:translateY(14px)}}to{{opacity:1;transform:translateY(0)}}}}
+  @keyframes blink{{0%,100%{{opacity:1}}50%{{opacity:.3}}}}
+  @media(max-width:600px){{.hero{{padding:44px 16px 32px;}}.card{{padding:20px;}}.card-footer{{flex-direction:column;gap:6px;align-items:flex-start;}}}}
+</style>
+</head>
+<body>
+  <div class="hero">
+    <div class="hero-badge">AI-Curated News Digest</div>
+    <h1>{page_title}</h1>
+    <p>{page_desc}</p>
+    <p class="meta">Generated {gen_date} · Multi-Agent AI System · Run #{run_num}</p>
+    <div class="memory-bar">
+      <div class="memory-stat">🧬 {num_entities} entities in knowledge base</div>
+      <div class="memory-stat">📖 {len(memory.episodes)} past runs learned from</div>
+      <div class="memory-stat">⚙️ Avg quality: {memory.strategies.get('avg_quality_score', 'N/A')}/10</div>
+    </div>
+  </div>
+  <div class="wrap">
+    <div class="grid">{cards_html}</div>
+  </div>
+  <footer>Built by Multi-Agent AI System with Memory · LangChain + LangGraph</footer>
+</body>
+</html>"""
+
+    print(f"    HTML generated ({len(html):,} chars)")
+
+    return {
+        "html_content": html,
+        "agent_log": [f"[HTML Builder] Page with {len(articles)} articles"],
+    }
+
+# Step  11: AGENT 5 — QA AGENT (Memory-Enhanced)
+
+
+def qa_agent(state: AgentState) -> dict:
+    """
+     QA Agent (Memory-Enhanced)
+    Compares against past quality scores. Logs episode. Updates strategies.
+    """
+    print(" [QA Agent] Reviewing (with historical context)...")
+
+    revision_count = state.get("revision_count", 0)
+    articles = state.get("articles", [])
+
+    # Get past performance for context
+    recent_eps = memory.get_recent_episodes(3)
+    past_scores = [ep.get("qa_score", 0) for ep in recent_eps if ep.get("qa_score")]
+    avg_past = sum(past_scores) / len(past_scores) if past_scores else 0
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", """You are a strict QA reviewer for an AI news page.
+
+Historical context: Past runs averaged {avg_past}/10 quality.
+Current revision: #{revision_count} of max {max_revisions}.
+
+Review for: content quality, completeness (min 5 articles), HTML validity, design.
+
+Return ONLY valid JSON:
+{{"passed": true/false, "score": 1-10, "feedback": "specific actionable feedback"}}
+
+Be reasonable — minor issues pass. Only fail for significant problems."""),
+        ("human", "Articles: {num_articles}\nHTML length: {html_len}\nSample: {sample}")
+    ])
+
+    sample = json.dumps(articles[0], indent=2) if articles else "{}"
+    chain = prompt | llm | JsonOutputParser()
+    result = chain.invoke({
+        "avg_past": round(avg_past, 1),
+        "revision_count": revision_count,
+        "max_revisions": CONFIG["max_revisions"],
+        "num_articles": len(articles),
+        "html_len": len(state.get("html_content", "")),
+        "sample": sample,
+    })
+
+    passed = result.get("passed", True)
+    score = result.get("score", 7)
+    feedback = result.get("feedback", "")
+
+    if revision_count >= CONFIG["max_revisions"]:
+        passed = True
+        feedback = "Max revisions reached — approving."
+
+    status = "APPROVED ✅" if passed else "NEEDS REVISION ⚠️"
+    print(f"   📊 Score: {score}/10 — {status} (past avg: {avg_past:.1f})")
+    if feedback:
+        print(f"   💬 {feedback[:120]}")
+
+    return {
+        "qa_passed": passed,
+        "qa_score": score,
+        "qa_feedback": feedback,
+        "revision_count": revision_count + 1,
+        "agent_log": [f"[QA] Score: {score}/10 — {status}"],
+    }
+
+# Step 12: BUILD THE LANGGRAPH WORKFLOW (with Memory Nodes)
+
+
+def should_revise(state: AgentState) -> str:
+    """Conditional edge: revise or save & finish."""
+    if state.get("qa_passed", False):
+        return "save"
+    else:
+        return "revise"
+
+
+# Build the graph
+workflow = StateGraph(AgentState)
+
+# Agent nodes
+workflow.add_node("load_memory", load_memory_node)
+workflow.add_node("orchestrator", orchestrator_agent)
+workflow.add_node("research", research_agent)
+workflow.add_node("writer", writer_agent)
+workflow.add_node("html_builder", html_builder_agent)
+workflow.add_node("qa_review", qa_agent)
+workflow.add_node("save_memory", save_memory_node)
+
+# Edges with memory nodes interleaved
+workflow.add_edge(START, "load_memory")           # ① Load all memory
+workflow.add_edge("load_memory", "orchestrator")  # ② Plan with memory
+workflow.add_edge("orchestrator", "research")     # ③ Search the web
+workflow.add_edge("research", "writer")           # ④ Write content
+workflow.add_edge("writer", "html_builder")       # ⑤ Build HTML
+workflow.add_edge("html_builder", "qa_review")    # ⑥ QA review
+
+# Conditional: QA → save & end, or → revise
+workflow.add_conditional_edges(
+    "qa_review",
+    should_revise,
+    {
+        "save": "save_memory",   # ✅ Passed → persist memory → END
+        "revise": "writer",      # ⚠️ Failed → back to writer
+    }
+)
+workflow.add_edge("save_memory", END)             # ⑦ Done!
+
+graph = workflow.compile()
+
+print(" LangGraph workflow compiled with memory nodes!")
+print("   Flow: load_memory → orchestrator → research → writer → html_builder → qa_review")
+print("   Memory: load_memory (start) + save_memory (end)")
+print("   Loop: qa_review → writer (if revision needed)")
+
+# Step 13:  RUN THE PIPELINE
+
+print("=" * 65)
+print(" LAUNCHING MULTI-AGENT PIPELINE (with Memory)")
+print(f" Topic: {CONFIG['topic']}")
+print(f" Memory: {len(memory.episodes)} past episodes | {len(memory.knowledge_base.get('entities', {}))} entities")
+print("=" * 65)
+
+final_state = graph.invoke({
+    "topic": CONFIG["topic"],
+    "search_queries": [],
+    "raw_search_results": [],
+    "articles": [],
+    "page_title": "",
+    "page_description": "",
+    "html_content": "",
+    "qa_passed": False,
+    "qa_feedback": "",
+    "qa_score": 0,
+    "revision_count": 0,
+    "agent_log": ["[System] Pipeline started with memory"],
+    "similar_past_articles": [],
+    "known_entities": {},
+    "past_run_lessons": [],
+    "preferred_template": "",
+    "best_query_patterns": [],
+    "writer_tips": [],
+})
+
+print("\n" + "=" * 65)
+print(" PIPELINE COMPLETE")
+print(f"   Revisions: {final_state['revision_count']}")
+print(f"   Articles:  {len(final_state['articles'])}")
+print(f"   QA Score:  {final_state.get('qa_score', 'N/A')}/10")
+print(f"   HTML size: {len(final_state['html_content']):,} chars")
+print(f"   Entities:  {len(memory.knowledge_base.get('entities', {}))} in KB")
+print(f"   Episodes:  {len(memory.episodes)} total")
+print("=" * 65)
+
+print("\n Agent Log:")
+for entry in final_state.get("agent_log", []):
+    print(f"   {entry}")
+
+# Step 14: DISPLAY THE OUTPUT
+
+from IPython.display import HTML, display
+display(HTML(final_state["html_content"]))
+
+# Step 15: SAVE & DOWNLOAD
+
+output_path = "ai_news_page.html"
+with open(output_path, "w") as f:
+    f.write(final_state["html_content"])
+
+print(f" HTML saved: {output_path}")
+print(f" Memory persisted to: {CONFIG['memory_dir']}/")
+print(f"   ├── vectorstore/    (FAISS long-term memory)")
+print(f"   ├── knowledge_base.json (semantic memory)")
+print(f"   ├── episodes.json   (episodic memory)")
+print(f"   └── strategies.json (procedural memory)")
+
+try:
+    from google.colab import files
+    files.download(output_path)
+    print(" Download triggered!")
+except ImportError:
+    pass
+
+# Step 16: (BONUS) INSPECT MEMORY STATE
+
+print(" MEMORY INSPECTION")
+print("=" * 50)
+
+print("\n SEMANTIC MEMORY — Known Entities:")
+for name, info in list(memory.knowledge_base.get("entities", {}).items())[:10]:
+    print(f"   • {name}: {info}")
+
+print(f"\n EPISODIC MEMORY — Last 3 Runs:")
+for ep in memory.episodes[-3:]:
+    print(f"   • {ep.get('run_id', '?')} | Score: {ep.get('qa_score', '?')}/10 | "
+          f"Articles: {ep.get('num_articles', '?')} | "
+          f"First-try pass: {ep.get('qa_passed_first_try', '?')}")
+
+print(f"\n  PROCEDURAL MEMORY — Strategies:")
+print(f"   Avg Quality Score: {memory.strategies.get('avg_quality_score', 'N/A')}/10")
+print(f"   Total Runs: {memory.strategies.get('total_runs', 0)}")
+print(f"   Best Query Patterns: {memory.strategies.get('best_query_patterns', [])[:5]}")
+print(f"   Writer Tips: {memory.strategies.get('writer_tips', [])[:3]}")
+
+print(f"\n LONG-TERM MEMORY (Vector Store):")
+if memory.vectorstore:
+    print(f"   Vectors stored: {memory.vectorstore.index.ntotal}")
+else:
+    print(" Not initialized")

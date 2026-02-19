@@ -1,0 +1,37 @@
+{
+  "entities": {
+    "Healthcare AI": {
+      "type": "concept",
+      "context": "The application of artificial intelligence technologies in the healthcare sector."
+    },
+    "AI Agents": {
+      "type": "concept",
+      "context": "Autonomous software entities that perform tasks using artificial intelligence."
+    },
+    "Blockchain": {
+      "type": "concept",
+      "context": "A decentralized digital ledger technology used for secure and transparent record-keeping."
+    },
+    "Quantum Computing": {
+      "type": "concept",
+      "context": "A type of computing that uses quantum-mechanical phenomena to perform operations on data."
+    },
+    "Clinical Trials": {
+      "type": "concept",
+      "context": "Research studies performed on people to evaluate medical, surgical, or behavioral interventions."
+    },
+    "Hyperscale AI Data Centers": {
+      "type": "concept",
+      "context": "Large-scale data centers designed to support massive computing power and storage for AI applications."
+    },
+    "Health and Life Sciences": {
+      "type": "concept",
+      "context": "Fields of study and industries focused on healthcare, medicine, and biological sciences."
+    },
+    "Artificial Intelligence": {
+      "type": "concept",
+      "context": "The simulation of human intelligence processes by machines, especially computer systems."
+    }
+  },
+  "source_reliability": {}
+}

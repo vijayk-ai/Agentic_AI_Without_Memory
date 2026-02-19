@@ -1,0 +1,829 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# ================================================================================
+# AGENTIC AI AUTONOMOUS SYSTEM — Multi-Agent News → HTML Pipeline
+# ================================================================================
+# Framework: LangChain + LangGraph
+# Platform:  Google Colab
+# Agents:    Orchestrator → Research → Writer → HTML Builder → QA Reviewer
+# 
+# HOW TO USE:
+# 1. Open this file in Google Colab
+# 2. Add your API keys in Colab Secrets (🔑 icon in sidebar):
+#    - OPENAI_API_KEY
+# 3. Run all cells sequentially
+# ================================================================================
+
+# In[1]:
+
+
+# In[2]:
+
+
+# Step 2 CONFIGURATION & API KEYS
+import os
+import json
+import webbrowser
+import os
+
+from datetime import datetime
+from langchain_community.tools.tavily_search import TavilySearchResults
+
+
+# --- Option A: Google Colab Secrets (Recommended) ---
+# Go to 🔑 icon in left sidebar → Add secrets
+try:
+    from google.colab import userdata
+    os.environ["OPENAI_API_KEY"] = userdata.get("OPENAI_API_KEY")
+    os.environ["TAVILY_API_KEY"] = userdata.get("TAVILY_API_KEY")
+    # Uncomment for Gemini instead of OpenAI:
+    # os.environ["GOOGLE_API_KEY"] = userdata.get("GOOGLE_API_KEY")
+    print(" API keys loaded from Colab Secrets")
+except Exception:
+    print(" Colab Secrets not found. Set keys manually below:")
+
+# Configuration
+CONFIG = {
+    "llm_provider": "openai",         # "openai" or "google"
+    "model_name": "gpt-4o",           # or "gemini-1.5-flash" / "gemini-1.5-pro"
+    "temperature": 0.3,
+    "max_search_results": 8,
+    "max_revisions": 2,                # Max QA revision loops
+    "topic": "Latest AI News and Breakthroughs in 2025-2026",
+}
+
+print(f"🔧 Config: {CONFIG['llm_provider']} / {CONFIG['model_name']}")
+
+
+# In[3]:
+
+
+# Step 3 IMPORTS & LLM SETUP
+
+from typing import TypedDict, Annotated, List, Optional
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
+from langchain_community.tools.tavily_search import TavilySearchResults
+from langgraph.graph import StateGraph, END, START
+import operator
+
+# Initialize LLM based on config
+
+if CONFIG["llm_provider"] == "openai":
+    from langchain_openai import ChatOpenAI
+    llm = ChatOpenAI(
+        model=CONFIG["model_name"],
+        temperature=CONFIG["temperature"],
+    )
+elif CONFIG["llm_provider"] == "google":
+    from langchain_google_genai import ChatGoogleGenerativeAI
+    llm = ChatGoogleGenerativeAI(
+        model=CONFIG["model_name"],
+        temperature=CONFIG["temperature"],
+    )
+
+# Initialize search tool
+search_tool = TavilySearchResults(
+   max_results=CONFIG["max_search_results"],
+  search_depth="advanced",
+ include_answer=True,
+include_raw_content=False,
+)
+
+print(f" LLM initialized: {CONFIG['model_name']}")
+print(f" Tavily Search tool ready")
+
+
+# In[4]:
+
+
+# Step 4 DEFINE SHARED STATE SCHEMA / RULE
+
+class AgentState(TypedDict):
+    """Shared state passed between all agents via LangGraph."""
+
+    # Input
+    topic: str
+
+    # Research Agent outputs
+    search_queries: List[str]
+    raw_search_results: List[dict]
+
+    # Writer Agent outputs
+    articles: List[dict]          # Structured article data
+    page_title: str
+    page_description: str
+
+    # HTML Builder outputs
+    html_content: str
+
+    # QA Agent outputs
+    qa_passed: bool
+    qa_feedback: str
+    revision_count: int
+
+    # Message log for debugging
+    agent_log: Annotated[List[str], operator.add]
+
+print(" AgentState schema defined")
+
+
+# In[5]:
+
+
+# Step 5: AGENT 1 — ORCHESTRATOR (Planner)
+
+def orchestrator_agent(state: AgentState) -> dict:
+    """
+     Orchestrator Agent
+    Breaks down the user topic into targeted search queries.
+    This is the planning phase that guides the research agent.
+    """
+    print(" [Orchestrator] Planning search strategy...")
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", """You are a strategic research planner for an AI news aggregation system.
+Given a topic, generate 3-5 specific, diverse search queries that will find the most
+relevant and recent news articles. Each query should target a different angle or subtopic.
+
+Return ONLY valid JSON in this exact format:
+{{"queries": ["query 1", "query 2", "query 3"]}}"""),
+        ("human", "Topic: {topic}\nToday's date: {date}")
+    ])
+
+    chain = prompt | llm | JsonOutputParser()
+
+    result = chain.invoke({
+        "topic": state["topic"],
+        "date": datetime.now().strftime("%B %d, %Y"),
+    })
+
+    queries = result.get("queries", [state["topic"]])
+    print(f"    Generated {len(queries)} search queries")
+    for i, q in enumerate(queries, 1):
+        print(f"      {i}. {q}")
+
+    return {
+        "search_queries": queries,
+        "revision_count": state.get("revision_count", 0),
+        "agent_log": [f"[Orchestrator] Generated {len(queries)} queries"],
+    }
+
+
+# In[6]:
+
+
+# Step 6: AGENT 2 — RESEARCH AGENT (Web Search)
+
+def research_agent(state: AgentState) -> dict:
+    """
+    Research Agent
+    Executes web searches using Tavily and collects raw results.
+    Handles deduplication based on URLs.
+    """
+    print(" [Research Agent] Searching the web...")
+
+    all_results = []
+    seen_urls = set()
+
+    for query in state["search_queries"]:
+        try:
+            results = search_tool.invoke(query)
+            for r in results:
+                url = r.get("url", "")
+                if url not in seen_urls:
+                    seen_urls.add(url)
+                    all_results.append({
+                        "title": r.get("title", "Untitled"),
+                        "url": url,
+                        "content": r.get("content", ""),
+                        "query": query,
+                    })
+            print(f"    '{query}' → {len(results)} results")
+        except Exception as e:
+            print(f"    '{query}' → Error: {e}")
+
+    print(f"   Total unique results: {len(all_results)}")
+
+    return {
+        "raw_search_results": all_results,
+        "agent_log": [f"[Research] Found {len(all_results)} unique results"],
+    }
+
+
+# In[7]:
+
+
+# Step 7: AGENT 3 — WRITER AGENT (Content Synthesis)
+
+def writer_agent(state: AgentState) -> dict:
+    """
+    Writer Agent
+    Transforms raw search results into structured, polished article summaries.
+    Generates headlines, descriptions, and categorized content.
+    """
+    print("  [Writer Agent] Synthesizing content...")
+
+    # Include QA feedback if this is a revision
+    revision_note = ""
+    if state.get("qa_feedback") and state.get("revision_count", 0) > 0:
+        revision_note = f"\n\nPREVIOUS QA FEEDBACK (please address this):\n{state['qa_feedback']}"
+
+    # Prepare search data for the prompt
+    search_data = json.dumps(state["raw_search_results"][:15], indent=2, default=str)
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", """You are an expert AI news journalist and content curator.
+Transform the raw search results into structured article summaries.
+
+Return ONLY valid JSON in this exact format:
+{{
+  "page_title": "A compelling page title",
+  "page_description": "A brief description of the page content",
+  "articles": [
+    {{
+      "headline": "Article headline",
+      "summary": "2-3 sentence summary of the article",
+      "category": "One of: Research, Industry, Policy, Product, Open Source",
+      "source": "Source name",
+      "url": "Article URL",
+      "importance": "high/medium/low"
+    }}
+  ]
+}}
+
+Guidelines:
+- Write clear, engaging summaries in your own words
+- Include 5-10 of the most newsworthy articles
+- Sort by importance (high first)
+- Ensure diversity across categories
+- Make headlines compelling but accurate{revision_note}"""),
+        ("human", "Raw search data:\n{search_data}")
+    ])
+
+    chain = prompt | llm | JsonOutputParser()
+
+    result = chain.invoke({
+        "search_data": search_data,
+        "revision_note": revision_note,
+    })
+
+    articles = result.get("articles", [])
+    print(f"    Generated {len(articles)} article summaries")
+    for a in articles[:3]:
+        print(f"      • {a.get('headline', 'Untitled')[:60]}...")
+
+    return {
+        "articles": articles,
+        "page_title": result.get("page_title", "AI News Roundup"),
+        "page_description": result.get("page_description", ""),
+        "agent_log": [f"[Writer] Produced {len(articles)} articles"],
+    }
+
+
+# In[8]:
+
+
+# Step 8: AGENT 4 — HTML BUILDER AGENT
+
+def html_builder_agent(state: AgentState) -> dict:
+    """
+     HTML Builder Agent
+    Generates a complete, styled, responsive HTML page from structured content.
+    """
+    print("  [HTML Builder] Generating HTML page...")
+
+    articles = state.get("articles", [])
+    page_title = state.get("page_title", "AI News")
+    page_desc = state.get("page_description", "")
+
+    # Build article cards HTML
+    category_colors = {
+        "Research": "#7b61ff",
+        "Industry": "#00d4aa",
+        "Policy": "#ff6b9d",
+        "Product": "#ffb347",
+        "Open Source": "#4ecdc4",
+    }
+
+    article_cards = ""
+    for i, article in enumerate(articles):
+        cat = article.get("category", "General")
+        color = category_colors.get(cat, "#888")
+        importance = article.get("importance", "medium")
+        badge_size = "font-size:12px;padding:4px 12px;" if importance == "high" else "font-size:11px;padding:3px 10px;"
+
+        article_cards += f"""
+        <article class="card" style="animation-delay: {i * 0.08}s">
+          <div class="card-badge" style="background:{color}15;color:{color};border:1px solid {color}33;{badge_size}">
+            {cat}
+          </div>
+          <h2 class="card-title">{article.get("headline", "Untitled")}</h2>
+          <p class="card-summary">{article.get("summary", "")}</p>
+          <div class="card-footer">
+            <span class="card-source">{article.get("source", "Unknown")}</span>
+            <a href="{article.get("url", "#")}" target="_blank" rel="noopener" class="card-link">
+              Read Full Article →
+            </a>
+          </div>
+        </article>"""
+
+    # Generate the complete HTML page
+    generated_date = datetime.now().strftime("%B %d, %Y at %I:%M %p")
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{page_title}</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Playfair+Display:wght@700&display=swap" rel="stylesheet">
+<style>
+  :root {{
+    --bg: #0f0f14;
+    --surface: #181820;
+    --border: #2a2a38;
+    --text: #e4e4ec;
+    --text-dim: #9494ac;
+    --accent: #7b61ff;
+  }}
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{
+    font-family: 'Inter', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+    min-height: 100vh;
+  }}
+  .hero {{
+    text-align: center;
+    padding: 80px 24px 60px;
+    background: linear-gradient(180deg, #1a1a2e 0%, var(--bg) 100%);
+    border-bottom: 1px solid var(--border);
+  }}
+  .hero-badge {{
+    display: inline-block;
+    padding: 5px 14px;
+    border: 1px solid var(--accent);
+    border-radius: 100px;
+    font-size: 11px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 24px;
+  }}
+  .hero h1 {{
+    font-family: 'Playfair Display', serif;
+    font-size: clamp(32px, 5vw, 56px);
+    font-weight: 700;
+    line-height: 1.15;
+    margin-bottom: 16px;
+    background: linear-gradient(135deg, #fff, #ccc);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }}
+  .hero p {{
+    font-size: 16px;
+    color: var(--text-dim);
+    max-width: 600px;
+    margin: 0 auto 12px;
+  }}
+  .hero .date {{
+    font-size: 12px;
+    color: #666;
+  }}
+  .container {{
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 40px 24px 80px;
+  }}
+  .grid {{
+    display: grid;
+    gap: 20px;
+  }}
+  .card {{
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 28px;
+    transition: transform 0.3s ease, box-shadow 0.3s ease;
+    animation: fadeUp 0.5s ease both;
+  }}
+  .card:hover {{
+    transform: translateY(-3px);
+    box-shadow: 0 12px 40px rgba(0,0,0,0.3);
+  }}
+  .card-badge {{
+    display: inline-block;
+    border-radius: 6px;
+    font-weight: 600;
+    margin-bottom: 14px;
+  }}
+  .card-title {{
+    font-size: 20px;
+    font-weight: 700;
+    line-height: 1.3;
+    margin-bottom: 10px;
+  }}
+  .card-summary {{
+    font-size: 14px;
+    color: var(--text-dim);
+    line-height: 1.7;
+    margin-bottom: 16px;
+  }}
+  .card-footer {{
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding-top: 14px;
+    border-top: 1px solid var(--border);
+  }}
+  .card-source {{
+    font-size: 12px;
+    color: #666;
+    font-weight: 500;
+  }}
+  .card-link {{
+    font-size: 13px;
+    color: var(--accent);
+    text-decoration: none;
+    font-weight: 500;
+  }}
+  .card-link:hover {{ text-decoration: underline; }}
+  footer {{
+    text-align: center;
+    padding: 32px;
+    border-top: 1px solid var(--border);
+    font-size: 12px;
+    color: #555;
+  }}
+  @keyframes fadeUp {{
+    from {{ opacity: 0; transform: translateY(16px); }}
+    to {{ opacity: 1; transform: translateY(0); }}
+  }}
+  @media (max-width: 600px) {{
+    .hero {{ padding: 48px 16px 36px; }}
+    .card {{ padding: 20px; }}
+    .card-footer {{ flex-direction: column; gap: 8px; align-items: flex-start; }}
+  }}
+</style>
+</head>
+<body>
+  <div class="hero">
+    <div class="hero-badge"> AI-Generated News Digest</div>
+    <h1>{page_title}</h1>
+    <p>{page_desc}</p>
+    <p class="date">Generated on {generated_date} · Powered by Multi-Agent AI System</p>
+  </div>
+  <div class="container">
+    <div class="grid">
+      {article_cards}
+    </div>
+  </div>
+  <footer>
+    Built with LangChain + LangGraph Multi-Agent System · Autonomous AI Pipeline
+  </footer>
+</body>
+</html>"""
+
+    print(f"  HTML page generated ({len(html):,} characters)")
+
+    return {
+        "html_content": html,
+        "agent_log": [f"[HTML Builder] Generated page with {len(articles)} articles"],
+    }
+
+
+# In[9]:
+
+
+# Step 9: AGENT 5 — QA / REVIEW AGENT
+
+
+def qa_agent(state: AgentState) -> dict:
+    """
+     QA / Review Agent
+    Validates the generated HTML page for quality, completeness, and correctness.
+    Decides whether to approve or send back for revision.
+    """
+    print(" [QA Agent] Reviewing output...")
+
+    revision_count = state.get("revision_count", 0)
+    html_content = state.get("html_content", "")
+    articles = state.get("articles", [])
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", """You are a strict quality assurance reviewer for an AI news page.
+Review the content and HTML for:
+1. Content quality: Are summaries clear and informative?
+2. Completeness: Are there at least 5 articles?
+3. HTML validity: Is the HTML well-structured?
+4. Design: Does it look professional?
+
+Return ONLY valid JSON:
+{{
+  "passed": true/false,
+  "score": 1-10,
+  "feedback": "Specific actionable feedback if not passed"
+}}
+
+Be reasonable — minor issues should still pass. Only fail for significant problems.
+This is revision #{revision_count}. Max allowed revisions: {max_revisions}."""),
+        ("human", "Number of articles: {num_articles}\nHTML length: {html_length}\nSample article: {sample}\nFirst 500 chars of HTML: {html_preview}")
+    ])
+
+    sample = json.dumps(articles[0], indent=2) if articles else "{}"
+
+    chain = prompt | llm | JsonOutputParser()
+
+    result = chain.invoke({
+        "num_articles": len(articles),
+        "html_length": len(html_content),
+        "sample": sample,
+        "html_preview": html_content[:500],
+        "revision_count": revision_count,
+        "max_revisions": CONFIG["max_revisions"],
+    })
+
+    passed = result.get("passed", True)
+    score = result.get("score", 7)
+    feedback = result.get("feedback", "")
+
+    # Force pass if we've hit max revisions
+    if revision_count >= CONFIG["max_revisions"]:
+        passed = True
+        feedback = "Max revisions reached — approving current version."
+
+    status = "APPROVED ✅" if passed else "NEEDS REVISION ⚠️"
+    print(f"   📊 Score: {score}/10 — {status}")
+    if feedback:
+        print(f"   💬 Feedback: {feedback[:100]}")
+
+    return {
+        "qa_passed": passed,
+        "qa_feedback": feedback,
+        "revision_count": revision_count + 1,
+        "agent_log": [f"[QA] Score: {score}/10 — {status}"],
+    }
+
+
+# In[10]:
+
+
+# Step 10 : BUILD THE LANGGRAPH WORKFLOW
+
+def should_revise(state: AgentState) -> str:
+    """Conditional edge: route to revision or end based on QA result."""
+    if state.get("qa_passed", False):
+        return "end"
+    else:
+        return "revise"
+
+# Build the state graph
+workflow = StateGraph(AgentState)
+
+# Add all agent nodes
+workflow.add_node("orchestrator", orchestrator_agent)
+workflow.add_node("research", research_agent)
+workflow.add_node("writer", writer_agent)
+workflow.add_node("html_builder", html_builder_agent)
+workflow.add_node("qa_review", qa_agent)
+
+# Define the edges (workflow sequence)
+workflow.add_edge(START, "orchestrator")          # Entry point
+workflow.add_edge("orchestrator", "research")     # Plan → Search
+workflow.add_edge("research", "writer")           # Search → Write
+workflow.add_edge("writer", "html_builder")       # Write → Build HTML
+workflow.add_edge("html_builder", "qa_review")    # Build → QA Review
+
+# Conditional edge from QA: approve or loop back
+workflow.add_conditional_edges(
+    "qa_review",
+    should_revise,
+    {
+        "end": END,                               # QA passed → Done!
+        "revise": "writer",                       # QA failed → Back to Writer
+    }
+)
+
+# Compile the graph
+graph = workflow.compile()
+
+print(" LangGraph workflow compiled!")
+print("   Nodes: orchestrator → research → writer → html_builder → qa_review")
+print("   Conditional: qa_review → END or → writer (revision loop)")
+
+
+# In[11]:
+
+
+# Step 11: RUN THE MULTI-AGENT PIPELINE
+
+print("=" * 60)
+print(" LAUNCHING MULTI-AGENT PIPELINE")
+print(f" Topic: {CONFIG['topic']}")
+print("=" * 60)
+
+# Invoke the graph with initial state
+final_state = graph.invoke({
+    "topic": CONFIG["topic"],
+    "search_queries": [],
+    "raw_search_results": [],
+    "articles": [],
+    "page_title": "",
+    "page_description": "",
+    "html_content": "",
+    "qa_passed": False,
+    "qa_feedback": "",
+    "revision_count": 0,
+    "agent_log": ["[System] Pipeline started"],
+})
+
+print("\n===== FINAL STATE KEYS =====")
+print(final_state.keys())
+print("============================\n")
+
+# Extract HTML directly from final state
+# Extract correct HTML key
+html_output = final_state["html_content"]
+
+print("HTML length:", len(html_output))
+
+# Save to file
+html_file_name = "ai_news_page.html"
+with open(html_file_name, "w", encoding="utf-8") as f:
+    f.write(html_output)
+
+# Open in browser
+import os, webbrowser
+abs_path = os.path.abspath(html_file_name)
+webbrowser.open(f"file://{abs_path}")
+
+print(f"Opened in browser: {abs_path}")
+
+
+
+print("HTML length from state:", len(html_output))
+
+# Save to file
+html_file_name = "ai_news_page.html"
+with open(html_file_name, "w", encoding="utf-8") as f:
+    f.write(html_output)
+
+import os, webbrowser
+abs_path = os.path.abspath(html_file_name)
+webbrowser.open(f"file://{abs_path}")
+
+print(f"Opened in browser: {abs_path}")
+
+
+print("\n===== DEBUG FINAL STATE =====")
+print(type(final_state))
+
+if isinstance(final_state, dict):
+    for k, v in final_state.items():
+        if isinstance(v, str):
+            print(f"{k} -> STRING length={len(v)}")
+        else:
+            print(f"{k} -> {type(v)}")
+print("=============================\n")
+
+
+
+# Inspect final state keys
+##print("FINAL STATE KEYS:", final_state.keys())
+
+# Get HTML from state (adjust key if needed)
+import webbrowser
+import os
+
+# ======= HTML OUTPUT FIX WITH AUTO-OPEN =======
+
+# Use the correct key from final_state
+html_output = final_state["html_content"]  # correct key
+
+# Wrap with standard HTML structure
+full_html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>AI News</title>
+<style>
+body {{ font-family: Arial, sans-serif; margin: 20px; line-height: 1.6; }}
+h1 {{ color: #333; }}
+.article {{ margin-bottom: 30px; }}
+.article h2 {{ margin: 0 0 10px 0; color: #0073e6; }}
+.article p {{ margin: 0; }}
+</style>
+</head>
+<body>
+<h1>{final_state.get('page_title', 'AI News')}</h1>
+<p>{final_state.get('page_description', '')}</p>
+{html_output}
+</body>
+</html>
+"""
+
+# Save to file
+html_file_path = "ai_news_page.html"
+with open(html_file_path, "w", encoding="utf-8") as f:
+    f.write(full_html)
+
+# Get absolute path
+abs_path = os.path.abspath(html_file_path)
+
+# Open in default web browser
+webbrowser.open(f"file://{abs_path}")
+
+print(f"✅ HTML page successfully saved and opened: {abs_path}")
+
+
+# Save to file
+html_file_name = "ai_news_page.html"
+with open(html_file_name, "w", encoding="utf-8") as f:
+    f.write(html_output)
+
+# Open in browser
+import os, webbrowser
+abs_path = os.path.abspath(html_file_name)
+webbrowser.open(f"file://{abs_path}")
+
+print(f"Opened in browser: {abs_path}")
+
+print("\n" + "=" * 60)
+print(" PIPELINE COMPLETE")
+print(f"   Revisions: {final_state['revision_count']}")
+print(f"   Articles: {len(final_state['articles'])}")
+print(f"   HTML size: {len(final_state['html_content']):,} chars")
+print("=" * 60)
+
+# Print the full agent log
+print("\n Agent Activity Log:")
+for entry in final_state.get("agent_log", []):
+    print(f"   {entry}")
+
+
+# In[12]:
+
+
+# Step 12: DISPLAY THE OUTPUT
+
+from IPython.display import HTML, display
+
+# Get HTML from final pipeline result
+html_output = final_state.get("html", "")
+
+print("FINAL STATE KEYS:", result.keys())
+
+# Save to file
+html_file_name = "ai_news_page.html"
+with open(html_file_name, "w", encoding="utf-8") as f:
+    f.write(html_output)
+
+print(f"HTML page saved to: {html_file_name}")
+
+# Open automatically in browser
+import os
+import webbrowser
+abs_path = os.path.abspath(html_file_name)
+webbrowser.open(f"file://{abs_path}")
+print(f"Opened in browser: {abs_path}")
+
+
+# Render the HTML page inline in Colab
+display(HTML(final_state["html_content"]))
+
+
+# In[13]:
+
+
+# Step 13: SAVE TO FILE
+
+# -----------------------------
+# Save & Display HTML Output
+# -----------------------------
+# Replace `html_page` with your actual HTML variable from the HTML Builder
+html_file_name = "ai_news_page.html"
+
+# Save HTML to file
+with open(html_file_name, "w", encoding="utf-8") as f:
+    f.write(html_page)  # use your actual HTML variable here  # pyright: ignore[reportUndefinedVariable]
+
+# Try to display in notebook
+try:
+    from IPython.display import HTML, display  # pyright: ignore[reportMissingImports]
+    display(HTML(html_page))  # pyright: ignore[reportUndefinedVariable]
+except ImportError:
+    # IPython not installed or running in terminal, skip
+    pass
+
+# Open in default browser (works in terminal)
+import os
+import webbrowser
+abs_path = os.path.abspath(html_file_name)
+webbrowser.open(f"file://{abs_path}")
+print(f"HTML page saved and opened in browser: {abs_path}")
+
